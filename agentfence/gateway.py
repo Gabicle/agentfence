@@ -1,6 +1,7 @@
 """A single protected application path for reading reports."""
 
 from dataclasses import dataclass
+import re
 from types import MappingProxyType
 from typing import Mapping, Protocol
 
@@ -61,9 +62,45 @@ class AuthorizationRequest:
     subject_attributes: SubjectAttributes
     resource_attributes: ResourceAttributes
 
+    def payload(self) -> dict[str, object]:
+        return {
+            "subjectType": self.subject_type,
+            "subjectId": self.subject_id,
+            "objectType": self.object_type,
+            "objectId": self.object_id,
+            "relation": self.relation,
+            "subjectAttributes": {
+                "subjectType": self.subject_type,
+                "subjectId": self.subject_id,
+                "region": self.subject_attributes.region,
+                "clearanceLevel": self.subject_attributes.clearance_level,
+            },
+            "resourceAttributes": {
+                "resourceType": self.object_type,
+                "resourceId": self.object_id,
+                "region": self.resource_attributes.region,
+                "sensitivityLevel": self.resource_attributes.sensitivity_level,
+            },
+        }
+
+
+_DECISION_ID = re.compile(r"[0-9a-f]{32}\Z")
+
+
+def _valid_decision_id(value: object) -> bool:
+    return isinstance(value, str) and _DECISION_ID.fullmatch(value) is not None
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationDecision:
+    approved: bool
+    decision_id: str | None = None
+    reason_code: str | None = None
+    failure: str | None = None
+
 
 class Authorizer(Protocol):
-    def authorize(self, request: AuthorizationRequest) -> bool: ...
+    def authorize(self, request: AuthorizationRequest) -> AuthorizationDecision: ...
 
 
 class Resolver:
@@ -141,10 +178,16 @@ class Gateway:
     def execute(self, trusted_actor_key: str, proposal: ToolProposal) -> str:
         request, report_id = self._resolver.resolve(trusted_actor_key, proposal)
         try:
-            allowed = self._authorizer.authorize(request)
+            decision = self._authorizer.authorize(request)
         except Exception as exc:
             raise AuthorizationDenied("authorization failed") from exc
-        if allowed is not True:
+        if (
+            type(decision) is not AuthorizationDecision
+            or decision.approved is not True
+            or not _valid_decision_id(decision.decision_id)
+            or decision.reason_code != "authorization_allowed"
+            or decision.failure is not None
+        ):
             raise AuthorizationDenied("report read denied")
         return self._executor.read_report(report_id)
 

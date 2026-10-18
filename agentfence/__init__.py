@@ -3,6 +3,7 @@
 from .gateway import (
     ActorRecord,
     AuthorizationDenied,
+    AuthorizationDecision,
     AuthorizationRequest,
     Authorizer,
     Gateway,
@@ -13,12 +14,16 @@ from .gateway import (
     SubjectAttributes,
     ToolProposal,
 )
+from .fga_http import ConfigurationError, FgaHttpAuthorizer
 
 __all__ = [
     "ActorRecord",
     "AuthorizationDenied",
+    "AuthorizationDecision",
     "AuthorizationRequest",
     "Authorizer",
+    "ConfigurationError",
+    "FgaHttpAuthorizer",
     "Gateway",
     "InvalidProposal",
     "ReportRecord",

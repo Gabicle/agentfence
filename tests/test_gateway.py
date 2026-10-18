@@ -6,6 +6,7 @@ import pytest
 from agentfence import (
     ActorRecord,
     AuthorizationDenied,
+    AuthorizationDecision,
     AuthorizationRequest,
     Gateway,
     InvalidProposal,
@@ -15,17 +16,19 @@ from agentfence import (
     ToolProposal,
 )
 
+DECISION_ID = "0123456789abcdef0123456789abcdef"
+
 
 class FakeAuthorizer:
     def __init__(self, decision: object) -> None:
         self.decision = decision
         self.requests: list[AuthorizationRequest] = []
 
-    def authorize(self, request: AuthorizationRequest) -> bool:
+    def authorize(self, request: AuthorizationRequest) -> AuthorizationDecision:
         self.requests.append(request)
         if isinstance(self.decision, Exception):
             raise self.decision
-        return cast(bool, self.decision)
+        return cast(AuthorizationDecision, self.decision)
 
 
 @pytest.fixture
@@ -41,7 +44,7 @@ def records() -> tuple[dict[str, ActorRecord], dict[str, ReportRecord]]:
 
 def test_authorized_read_uses_canonical_request_and_executes_once(records) -> None:
     actors, reports = records
-    authorizer = FakeAuthorizer(True)
+    authorizer = FakeAuthorizer(AuthorizationDecision(True, DECISION_ID, "authorization_allowed"))
     gateway = Gateway(actors, reports, authorizer)
 
     result = gateway.execute("session-1", ToolProposal("read_report", {"report_id": "quarterly"}))
@@ -66,7 +69,7 @@ def test_authorized_read_uses_canonical_request_and_executes_once(records) -> No
 
 
 def test_denial_prevents_execution(records) -> None:
-    authorizer = FakeAuthorizer(False)
+    authorizer = FakeAuthorizer(AuthorizationDecision(False, DECISION_ID, "relationship_denied"))
     gateway = Gateway(*records, authorizer)
 
     with pytest.raises(AuthorizationDenied, match="denied"):
@@ -89,6 +92,29 @@ def test_authorizer_exception_fails_closed(records) -> None:
 
 @pytest.mark.parametrize("decision", [1, "true"])
 def test_non_boolean_truthy_authorizer_response_fails_closed(records, decision) -> None:
+    authorizer = FakeAuthorizer(
+        AuthorizationDecision(decision, DECISION_ID, "authorization_allowed")
+    )
+    gateway = Gateway(*records, authorizer)
+
+    with pytest.raises(AuthorizationDenied, match="denied"):
+        gateway.execute("session-1", ToolProposal("read_report", {"report_id": "quarterly"}))
+
+    assert len(authorizer.requests) == 1
+    assert gateway.execution_log == ()
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        AuthorizationDecision(True),
+        AuthorizationDecision(True, "bad-id", "authorization_allowed"),
+        AuthorizationDecision(True, DECISION_ID, "relationship_denied"),
+        AuthorizationDecision(True, DECISION_ID, "authorization_allowed", "invalid_response"),
+        True,
+    ],
+)
+def test_invalid_structured_approval_never_executes(records, decision) -> None:
     authorizer = FakeAuthorizer(decision)
     gateway = Gateway(*records, authorizer)
 
@@ -112,7 +138,7 @@ def test_non_boolean_truthy_authorizer_response_fails_closed(records, decision) 
     ],
 )
 def test_proposal_cannot_override_trusted_authorization_fields(records, override) -> None:
-    authorizer = FakeAuthorizer(True)
+    authorizer = FakeAuthorizer(AuthorizationDecision(True, DECISION_ID, "authorization_allowed"))
     gateway = Gateway(*records, authorizer)
     proposal = ToolProposal("read_report", {"report_id": "quarterly", **override})
 
@@ -132,7 +158,7 @@ def test_proposal_cannot_override_trusted_authorization_fields(records, override
     ],
 )
 def test_unsupported_or_malformed_proposal_never_executes(records, proposal) -> None:
-    authorizer = FakeAuthorizer(True)
+    authorizer = FakeAuthorizer(AuthorizationDecision(True, DECISION_ID, "authorization_allowed"))
     gateway = Gateway(*records, authorizer)
 
     with pytest.raises(InvalidProposal):
@@ -143,7 +169,7 @@ def test_unsupported_or_malformed_proposal_never_executes(records, proposal) -> 
 
 
 def test_unknown_actor_or_report_never_executes(records) -> None:
-    authorizer = FakeAuthorizer(True)
+    authorizer = FakeAuthorizer(AuthorizationDecision(True, DECISION_ID, "authorization_allowed"))
     gateway = Gateway(*records, authorizer)
 
     with pytest.raises(InvalidProposal):
@@ -159,7 +185,9 @@ def test_proposal_and_trusted_records_are_snapshotted(records) -> None:
     actors, reports = records
     arguments = {"report_id": "quarterly"}
     proposal = ToolProposal("read_report", arguments)
-    gateway = Gateway(actors, reports, FakeAuthorizer(True))
+    gateway = Gateway(
+        actors, reports, FakeAuthorizer(AuthorizationDecision(True, DECISION_ID, "authorization_allowed"))
+    )
 
     arguments["report_id"] = "unknown"
     actors.clear()
