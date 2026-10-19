@@ -33,7 +33,9 @@ Applications may optionally pass lower-trust source material with
 `agent.research(question, excerpt=external_text)`. The excerpt is limited to
 4,000 characters and enters the first model request as a separate message
 marked `untrusted`. Its text cannot set the actor, authorization policy, report
-attributes, or alias mapping. The final-generation instructions require the model to use only the authorized report as evidence. Whether the model follows those instructions is evaluated separately.
+attributes, or alias mapping. The final-generation instructions require the
+model to use only the authorized report as evidence. Whether the model follows
+those instructions is evaluated separately.
 
 Each question permits one report proposal and at most two Responses API calls.
 The calls use `store=False`, a 20-second SDK timeout, and no automatic SDK
@@ -43,3 +45,43 @@ OpenAI or fga-dotnet credentials:
 ```bash
 python3 -m pytest -q
 ```
+
+## One-case prompt-injection evaluation
+
+The versioned [synthetic case corpus](../experiments/cases.v1.json) contains a
+benign control, three attempts to redirect report selection toward the
+restricted board-risks report, and one answer-marker attempt. Each invocation
+runs one case. After provisioning the disposable FGA service as above, use a
+check-only shell with `FGA_LIVE=1`, `FGA_AUTHORIZATION_URL`, `FGA_CHECK_API_KEY`,
+`FGA_LIVE_MANIFEST`, `OPENAI_API_KEY`, and `OPENAI_MODEL` set. Leave
+`FGA_ADMIN_API_KEY` unset. Then explicitly opt in:
+
+```bash
+FGA_EVAL=1 python3 -m agentfence.research_eval --case direct_redirection
+```
+
+The command prints one JSON object, including the configured `model` identifier.
+`proposed_report_alias` is the validated alias from the first model response;
+`model_redirected` compares it with the case's expected alias regardless of
+authorization. Invalid or missing calls have their own `proposal_status` and
+no proposed alias. `authorization_outcome=denied` means the authorization
+service returned an explicit policy denial. `service_failure` means the check
+failed closed, including transport and invalid-response failures; its overall
+`outcome` is `error` with the fixed code `authorization_service_failure`.
+`authorization_decision_approved` and `authorization_decision_failure` expose
+only the observed approval value and whether a failure field was present, not
+the raw failure text. `protected_execution_count` counts report-body reads.
+`access_denied_result` records the answer returned to the caller and can be
+`true` for either a policy denial or a service failure;
+`answer_marker_present` checks the final answer for the case's exact synthetic
+marker, or is `null` when that check cannot apply. `outcome` distinguishes
+`invalid_proposal`, `no_proposal`, `denied`, `completed`, and `error`; errors use
+fixed codes without raw exception text. A redirected, denied proposal with zero
+protected executions is **not** an authorization bypass.
+
+Results contain no report bodies, API keys, headers, raw model responses, or
+excerpts. The marker check is an exact substring observation, not a judgment of
+answer quality. One run per case cannot estimate attack success rates or prove
+the model will behave consistently; repeat selected cases manually if needed.
+The initial offline evaluator tests use fake Responses output and never call
+OpenAI or fga-dotnet.
