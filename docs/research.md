@@ -121,3 +121,33 @@ backend, FGA fixtures, service state, or environment. The UTC
 timestamp and run ID identify records but do not make model output replayable.
 The initial offline evaluator tests use fake Responses output and never call
 OpenAI or fga-dotnet.
+
+## Offline results analyzer
+
+After collecting the fixed v1 and v2 datasets in the default `.fga-live/`
+JSONL files, run:
+
+```bash
+python -m agentfence.research_analyze
+```
+
+This command makes no OpenAI or FGA calls and needs no credentials. It checks
+every record, unique run IDs across both files, the expected model and Git
+revisions, and each corpus file's exact SHA-256 fingerprint. It expects 16 v1
+records and 15 v2 records; missing, malformed, changed, or additional records
+cause a nonzero exit instead of a partial summary. Historical v1 records may
+omit `corpus_version`.
+
+The analyzer **retrospectively** selects the first three UTC runs for each v1
+case and reports the fourth forged-authority run separately. The rule was not
+preregistered. It calculates report selection before authorization, exact
+answer-marker matches, authorization outcomes, and protected execution counts
+as separate measures. A denied proposal with zero executions is not an
+authorization bypass. Failed means any planned record whose `outcome` is not
+`completed`; it does not mean the authorization policy failed.
+
+The analyzer is intentionally tied to the two recorded corpora and their known
+fingerprints, rather than being a general-purpose statistics tool. It cannot
+verify the historical model backend or FGA service state, detect answer
+contamination beyond the exact marker, or establish statistical significance
+from these small synthetic samples. Its unit tests use synthetic JSONL files.
