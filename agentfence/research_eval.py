@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
 from typing import Any, Mapping
+from uuid import uuid4
 
 from .fga_http import ConfigurationError, FgaHttpAuthorizer
 from .gateway import (
@@ -35,7 +42,9 @@ from .research import (
 from .research_smoke import _manifest
 
 
-CORPUS = Path(__file__).resolve().parents[1] / "experiments" / "cases.v1.json"
+ROOT = Path(__file__).resolve().parents[1]
+CORPUS = ROOT / "experiments" / "cases.v1.json"
+LIVE_DIR = ROOT / ".fga-live"
 CASE_IDS = frozenset(
     {
         "benign_control",
@@ -56,9 +65,9 @@ class Case:
     answer_marker: str | None
 
 
-def load_cases() -> tuple[Case, ...]:
+def load_cases(contents: bytes | None = None) -> tuple[Case, ...]:
     """Load the fixed, versioned synthetic corpus and reject malformed entries."""
-    data = json.loads(CORPUS.read_text(encoding="utf-8"))
+    data = json.loads(CORPUS.read_bytes() if contents is None else contents)
     if type(data) is not dict or set(data) != {"schema_version", "cases"}:
         raise ValueError("Invalid research evaluation corpus.")
     if (
@@ -94,6 +103,75 @@ def load_cases() -> tuple[Case, ...]:
     if {case.id for case in cases} != CASE_IDS:
         raise ValueError("Invalid research evaluation corpus.")
     return tuple(cases)
+
+
+def _git_commit() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "--verify", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return "unavailable"
+    sha = result.stdout.strip()
+    return sha if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) else "unavailable"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _run_metadata(contents: bytes) -> dict[str, str]:
+    return {
+        "run_id": uuid4().hex,
+        "timestamp_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+        "git_commit_sha": _git_commit(),
+        "corpus_sha256": hashlib.sha256(contents).hexdigest(),
+    }
+
+
+def _jsonl_path(value: str) -> Path:
+    """Accept only a direct .jsonl child of the private live directory."""
+    path = Path(value)
+    if (
+        not LIVE_DIR.is_dir()
+        or LIVE_DIR.is_symlink()
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl", path.name) is None
+        or path.parent.resolve() != LIVE_DIR.resolve()
+        or path.is_symlink()
+        or (path.exists() and not path.is_file())
+    ):
+        raise ValueError("Invalid JSONL output path.")
+    return path
+
+
+def _append_jsonl(path: Path, line: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("JSONL destination is not a regular file.")
+        encoded = (line + "\n").encode("utf-8")
+        if os.write(descriptor, encoded) != len(encoded):
+            raise OSError("Short JSONL write.")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _emit(measurement: dict[str, Any], path: Path | None) -> bool:
+    line = json.dumps(measurement, sort_keys=True)
+    print(line)
+    if path is not None:
+        try:
+            _append_jsonl(path, line)
+        except OSError:
+            print("Could not append experiment record.", file=sys.stderr)
+            return False
+    return True
 
 
 class ObservedAdapter:
@@ -183,6 +261,7 @@ def evaluate(
     authorizer: RecordingAuthorizer,
     *,
     model: str,
+    metadata: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run one case and return safe, aggregation-ready measurements."""
     observed_adapter = ObservedAdapter(adapter, aliases)
@@ -229,7 +308,7 @@ def evaluate(
         outcome = "completed"
     else:
         outcome = "error"
-    return {
+    measurement = {
         "schema_version": 1,
         "case_id": case.id,
         "model": model,
@@ -255,11 +334,36 @@ def evaluate(
         "outcome": outcome,
         "error_code": error_code if outcome == "error" else None,
     }
+    measurement.update(_run_metadata(CORPUS.read_bytes()) if metadata is None else metadata)
+    return measurement
+
+
+def _setup_failure(case: Case, model: str, metadata: Mapping[str, str]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "case_id": case.id,
+        "model": model,
+        "expected_report_alias": case.expected_report_alias,
+        "proposed_report_alias": None,
+        "proposal_status": "unobserved",
+        "model_redirected": None,
+        "authorization_outcome": "not_attempted",
+        "authorization_decision_approved": None,
+        "authorization_decision_failure": None,
+        "protected_execution_count": 0,
+        "access_denied_result": None,
+        "answer_marker_present": None,
+        "model_response_calls": 0,
+        "outcome": "error",
+        "error_code": "setup_failed",
+        **metadata,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Evaluate one synthetic research excerpt.")
     parser.add_argument("--case", required=True, help="One case ID from experiments/cases.v1.json")
+    parser.add_argument("--output-jsonl", help="Append one result to a .jsonl file in .fga-live/")
     args = parser.parse_args(argv)
     if os.environ.get("FGA_EVAL") != "1" or os.environ.get("FGA_LIVE") != "1":
         parser.error("Set FGA_EVAL=1 and FGA_LIVE=1 to opt in.")
@@ -268,37 +372,27 @@ def main(argv: list[str] | None = None) -> int:
     model = os.environ.get("OPENAI_MODEL", "")
     if not model.strip():
         parser.error("Set OPENAI_MODEL to a Responses-compatible model.")
-    cases = {case.id: case for case in load_cases()}
+    contents = CORPUS.read_bytes()
+    cases = {case.id: case for case in load_cases(contents)}
     if args.case not in cases:
         parser.error("Unknown case ID.")
+    metadata = _run_metadata(contents)
+    case = cases[args.case]
+    try:
+        output_path = _jsonl_path(args.output_jsonl) if args.output_jsonl else None
+    except (OSError, ValueError):
+        _emit(_setup_failure(case, model, metadata), None)
+        return 1
     try:
         authorizer = RecordingAuthorizer(FgaHttpAuthorizer.from_environment())
         gateway, aliases = gateway_from_manifest(_manifest(), authorizer)
         adapter = OpenAIResponsesAdapter()
     except (ConfigurationError, ValueError, OSError, ImportError):
-        measurement = {
-            "schema_version": 1,
-            "case_id": args.case,
-            "model": model,
-            "expected_report_alias": cases[args.case].expected_report_alias,
-            "proposed_report_alias": None,
-            "proposal_status": "unobserved",
-            "model_redirected": None,
-            "authorization_outcome": "not_attempted",
-            "authorization_decision_approved": None,
-            "authorization_decision_failure": None,
-            "protected_execution_count": 0,
-            "access_denied_result": None,
-            "answer_marker_present": None,
-            "model_response_calls": 0,
-            "outcome": "error",
-            "error_code": "setup_failed",
-        }
-        print(json.dumps(measurement, sort_keys=True))
+        _emit(_setup_failure(case, model, metadata), output_path)
         return 1
-    measurement = evaluate(cases[args.case], adapter, gateway, aliases, authorizer, model=model)
-    print(json.dumps(measurement, sort_keys=True))
-    return 0 if measurement["outcome"] in {"completed", "denied"} else 1
+    measurement = evaluate(case, adapter, gateway, aliases, authorizer, model=model, metadata=metadata)
+    appended = _emit(measurement, output_path)
+    return 0 if appended and measurement["outcome"] in {"completed", "denied"} else 1
 
 
 if __name__ == "__main__":

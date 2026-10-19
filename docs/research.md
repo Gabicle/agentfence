@@ -60,7 +60,26 @@ check-only shell with `FGA_LIVE=1`, `FGA_AUTHORIZATION_URL`, `FGA_CHECK_API_KEY`
 FGA_EVAL=1 python3 -m agentfence.research_eval --case direct_redirection
 ```
 
-The command prints one JSON object, including the configured `model` identifier.
+To retain results, add `--output-jsonl .fga-live/research-runs.jsonl`. Run the
+command again for each independent observation or case; each invocation makes
+at most the existing two model calls and appends one JSON line. For example:
+
+```bash
+FGA_EVAL=1 python3 -m agentfence.research_eval --case benign_control \
+  --output-jsonl .fga-live/research-runs.jsonl
+FGA_EVAL=1 python3 -m agentfence.research_eval --case direct_redirection \
+  --output-jsonl .fga-live/research-runs.jsonl
+```
+
+The same JSON is still printed to standard output. Setup failures and
+unsuccessful experiments are also appended when the destination is valid. The
+file must be a direct `.jsonl` child of `.fga-live/`; keep this private
+directory and its records out of Git.
+
+Each record includes the configured `model` identifier, a unique `run_id`, a UTC
+`timestamp_utc`, the current `git_commit_sha` (or `unavailable`), and
+`corpus_sha256` for the exact bytes of `experiments/cases.v1.json` used for that
+invocation.
 `proposed_report_alias` is the validated alias from the first model response;
 `model_redirected` compares it with the case's expected alias regardless of
 authorization. Invalid or missing calls have their own `proposal_status` and
@@ -83,5 +102,8 @@ Results contain no report bodies, API keys, headers, raw model responses, or
 excerpts. The marker check is an exact substring observation, not a judgment of
 answer quality. One run per case cannot estimate attack success rates or prove
 the model will behave consistently; repeat selected cases manually if needed.
+The commit SHA does not capture uncommitted code, and the corpus hash does not
+capture the model backend, FGA fixtures, service state, or environment. The UTC
+timestamp and run ID identify records but do not make model output replayable.
 The initial offline evaluator tests use fake Responses output and never call
 OpenAI or fga-dotnet.

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
 import json
+import stat
 from types import SimpleNamespace as Item
+from uuid import UUID
 
 import pytest
 
@@ -100,6 +104,34 @@ def run_case(case, adapter, setup):
     measured = evaluate(case, adapter, gateway, aliases, recorder, model="fake-model")
     assert measured["model"] == "fake-model"
     return measured
+
+
+def test_metadata_uses_fixed_utc_time_run_id_and_exact_corpus_bytes(monkeypatch):
+    monkeypatch.setattr(research_eval, "uuid4", lambda: UUID("12345678-1234-4234-8234-123456789abc"))
+    monkeypatch.setattr(
+        research_eval, "_utc_now", lambda: datetime(2026, 10, 19, 12, 30, tzinfo=timezone.utc)
+    )
+    monkeypatch.setattr(research_eval, "_git_commit", lambda: "a" * 40)
+    contents = research_eval.CORPUS.read_bytes()
+
+    metadata = research_eval._run_metadata(contents)
+
+    assert metadata == {
+        "run_id": "12345678123442348234123456789abc",
+        "timestamp_utc": "2026-10-19T12:30:00Z",
+        "git_commit_sha": "a" * 40,
+        "corpus_sha256": hashlib.sha256(contents).hexdigest(),
+    }
+    assert research_eval._run_metadata(contents + b"\n")["corpus_sha256"] != metadata["corpus_sha256"]
+
+
+def test_git_commit_has_explicit_unavailable_fallback(monkeypatch):
+    def missing_git(*args, **kwargs):
+        raise FileNotFoundError("git unavailable")
+
+    monkeypatch.setattr(research_eval.subprocess, "run", missing_git)
+
+    assert research_eval._git_commit() == "unavailable"
 
 
 def test_corpus_has_five_versioned_synthetic_scenarios(cases):
@@ -313,3 +345,109 @@ def test_cli_setup_failure_emits_same_safe_result_fields(monkeypatch, capsys):
     assert measured["protected_execution_count"] == 0
     assert measured["model_response_calls"] == 0
     assert "secret" not in json.dumps(measured)
+
+
+def test_cli_appends_one_json_line_per_independent_run(monkeypatch, capsys, tmp_path, setup):
+    live_dir = tmp_path / ".fga-live"
+    live_dir.mkdir()
+    output = live_dir / "research-runs.jsonl"
+    adapters = iter(
+        [
+            FakeAdapter(response(proposal(ALLOWED)), answer()),
+            FakeAdapter(answer("No report requested.")),
+        ]
+    )
+    identifiers = iter([UUID(int=1), UUID(int=2)])
+    monkeypatch.setattr(research_eval, "LIVE_DIR", live_dir)
+    monkeypatch.setattr(research_eval, "uuid4", lambda: next(identifiers))
+    monkeypatch.setattr(
+        research_eval, "_utc_now", lambda: datetime(2026, 10, 19, tzinfo=timezone.utc)
+    )
+    monkeypatch.setattr(research_eval, "_git_commit", lambda: "b" * 40)
+    monkeypatch.setenv("FGA_EVAL", "1")
+    monkeypatch.setenv("FGA_LIVE", "1")
+    monkeypatch.setenv("OPENAI_MODEL", "fake-model")
+    monkeypatch.delenv("FGA_ADMIN_API_KEY", raising=False)
+    monkeypatch.setattr(research_eval, "_manifest", lambda: setup[0])
+    monkeypatch.setattr(research_eval.FgaHttpAuthorizer, "from_environment", lambda: setup[3])
+    monkeypatch.setattr(research_eval, "OpenAIResponsesAdapter", lambda: next(adapters))
+
+    first_exit = main(["--case", "benign_control", "--output-jsonl", str(output)])
+    first_stdout = json.loads(capsys.readouterr().out)
+    second_exit = main(["--case", "benign_control", "--output-jsonl", str(output)])
+    second_stdout = json.loads(capsys.readouterr().out)
+    lines = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+
+    assert (first_exit, second_exit) == (0, 1)
+    assert lines == [first_stdout, second_stdout]
+    assert [line["outcome"] for line in lines] == ["completed", "no_proposal"]
+    assert [line["run_id"] for line in lines] == [UUID(int=1).hex, UUID(int=2).hex]
+    assert all(line["timestamp_utc"] == "2026-10-19T00:00:00Z" for line in lines)
+    assert all(line["git_commit_sha"] == "b" * 40 for line in lines)
+    assert all(
+        line["corpus_sha256"] == hashlib.sha256(research_eval.CORPUS.read_bytes()).hexdigest()
+        for line in lines
+    )
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    assert all(spec.body not in output.read_text(encoding="utf-8") for spec in REPORTS.values())
+
+
+def test_cli_rejects_malformed_jsonl_paths_before_api_setup(monkeypatch, capsys, tmp_path):
+    def forbidden_setup():
+        raise AssertionError("API setup must not run")
+
+    live_dir = tmp_path / ".fga-live"
+    live_dir.mkdir()
+    outside = tmp_path / "outside.jsonl"
+    link = live_dir / "linked.jsonl"
+    link.symlink_to(outside)
+    monkeypatch.setattr(research_eval, "LIVE_DIR", live_dir)
+    monkeypatch.setenv("FGA_EVAL", "1")
+    monkeypatch.setenv("FGA_LIVE", "1")
+    monkeypatch.setenv("OPENAI_MODEL", "fake-model")
+    monkeypatch.delenv("FGA_ADMIN_API_KEY", raising=False)
+    monkeypatch.setattr(research_eval, "_manifest", forbidden_setup)
+    for bad_path in (
+        outside,
+        live_dir / "wrong.txt",
+        live_dir / ".." / "escape.jsonl",
+        link,
+    ):
+        assert main(["--case", "benign_control", "--output-jsonl", str(bad_path)]) == 1
+        measured = json.loads(capsys.readouterr().out)
+        assert measured["outcome"] == "error"
+        assert measured["error_code"] == "setup_failed"
+        assert measured["model"] == "fake-model"
+        assert measured["protected_execution_count"] == 0
+        assert len(measured["corpus_sha256"]) == 64
+    assert not outside.exists()
+
+
+def test_cli_appends_safe_setup_failure(monkeypatch, capsys, tmp_path):
+    def broken_manifest():
+        raise ValueError("API key secret")
+
+    live_dir = tmp_path / ".fga-live"
+    live_dir.mkdir()
+    output = live_dir / "research-runs.jsonl"
+    monkeypatch.setattr(research_eval, "LIVE_DIR", live_dir)
+    monkeypatch.setenv("FGA_EVAL", "1")
+    monkeypatch.setenv("FGA_LIVE", "1")
+    monkeypatch.setenv("OPENAI_MODEL", "fake-model")
+    monkeypatch.delenv("FGA_ADMIN_API_KEY", raising=False)
+    monkeypatch.setattr(research_eval, "_manifest", broken_manifest)
+
+    exit_code = main(["--case", "benign_control", "--output-jsonl", str(output)])
+    stdout_record = json.loads(capsys.readouterr().out)
+    file_record = json.loads(output.read_text(encoding="utf-8").strip())
+
+    assert exit_code == 1
+    assert file_record == stdout_record
+    assert file_record["error_code"] == "setup_failed"
+    assert file_record["model"] == "fake-model"
+    assert file_record["model_response_calls"] == 0
+    assert file_record["protected_execution_count"] == 0
+    assert len(file_record["run_id"]) == 32
+    assert file_record["timestamp_utc"].endswith("Z")
+    assert file_record["corpus_sha256"] == hashlib.sha256(research_eval.CORPUS.read_bytes()).hexdigest()
+    assert "secret" not in output.read_text(encoding="utf-8")
