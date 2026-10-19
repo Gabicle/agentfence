@@ -1,9 +1,17 @@
 # AF-003a synthetic investment research smoke test
 
-Install the optional official OpenAI Python SDK alongside the test dependency:
+Run the research smoke test, experiment evaluator, and historical results
+analyzer from an AgentFence source checkout. These commands expect the
+versioned experiment corpora in the repository's `experiments/` directory and
+private configuration, fixture manifests, and historical JSONL records in its
+Git-ignored `.fga-live/` directory. An ordinary wheel installed outside the
+checkout does not provide a standalone research experiment environment.
+
+From the repository root, install the optional official OpenAI Python SDK and
+the test dependency in editable mode:
 
 ```bash
-python3 -m pip install -e '.[research,test]'
+python -m pip install -e '.[test,research]'
 ```
 
 First create and provision the disposable `agentfence-live` service using
