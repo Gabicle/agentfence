@@ -44,6 +44,7 @@ from .research_smoke import _manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 CORPUS = ROOT / "experiments" / "cases.v1.json"
+CORPORA = {"v1": CORPUS, "v2": ROOT / "experiments" / "cases.v2.json"}
 LIVE_DIR = ROOT / ".fga-live"
 CASE_IDS = frozenset(
     {
@@ -65,9 +66,11 @@ class Case:
     answer_marker: str | None
 
 
-def load_cases(contents: bytes | None = None) -> tuple[Case, ...]:
+def load_cases(contents: bytes | None = None, *, version: str = "v1") -> tuple[Case, ...]:
     """Load the fixed, versioned synthetic corpus and reject malformed entries."""
-    data = json.loads(CORPUS.read_bytes() if contents is None else contents)
+    if version not in CORPORA:
+        raise ValueError("Unknown research evaluation corpus version.")
+    data = json.loads(CORPORA[version].read_bytes() if contents is None else contents)
     if type(data) is not dict or set(data) != {"schema_version", "cases"}:
         raise ValueError("Invalid research evaluation corpus.")
     if (
@@ -261,6 +264,7 @@ def evaluate(
     authorizer: RecordingAuthorizer,
     *,
     model: str,
+    corpus_version: str = "v1",
     metadata: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run one case and return safe, aggregation-ready measurements."""
@@ -310,6 +314,7 @@ def evaluate(
         outcome = "error"
     measurement = {
         "schema_version": 1,
+        "corpus_version": corpus_version,
         "case_id": case.id,
         "model": model,
         "expected_report_alias": case.expected_report_alias,
@@ -334,13 +339,18 @@ def evaluate(
         "outcome": outcome,
         "error_code": error_code if outcome == "error" else None,
     }
-    measurement.update(_run_metadata(CORPUS.read_bytes()) if metadata is None else metadata)
+    measurement.update(
+        _run_metadata(CORPORA[corpus_version].read_bytes()) if metadata is None else metadata
+    )
     return measurement
 
 
-def _setup_failure(case: Case, model: str, metadata: Mapping[str, str]) -> dict[str, Any]:
+def _setup_failure(
+    case: Case, model: str, metadata: Mapping[str, str], corpus_version: str
+) -> dict[str, Any]:
     return {
         "schema_version": 1,
+        "corpus_version": corpus_version,
         "case_id": case.id,
         "model": model,
         "expected_report_alias": case.expected_report_alias,
@@ -362,7 +372,8 @@ def _setup_failure(case: Case, model: str, metadata: Mapping[str, str]) -> dict[
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Evaluate one synthetic research excerpt.")
-    parser.add_argument("--case", required=True, help="One case ID from experiments/cases.v1.json")
+    parser.add_argument("--case", required=True, help="One case ID from the selected corpus")
+    parser.add_argument("--corpus-version", choices=tuple(CORPORA), default="v1")
     parser.add_argument("--output-jsonl", help="Append one result to a .jsonl file in .fga-live/")
     args = parser.parse_args(argv)
     if os.environ.get("FGA_EVAL") != "1" or os.environ.get("FGA_LIVE") != "1":
@@ -372,8 +383,8 @@ def main(argv: list[str] | None = None) -> int:
     model = os.environ.get("OPENAI_MODEL", "")
     if not model.strip():
         parser.error("Set OPENAI_MODEL to a Responses-compatible model.")
-    contents = CORPUS.read_bytes()
-    cases = {case.id: case for case in load_cases(contents)}
+    contents = CORPORA[args.corpus_version].read_bytes()
+    cases = {case.id: case for case in load_cases(contents, version=args.corpus_version)}
     if args.case not in cases:
         parser.error("Unknown case ID.")
     metadata = _run_metadata(contents)
@@ -381,16 +392,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         output_path = _jsonl_path(args.output_jsonl) if args.output_jsonl else None
     except (OSError, ValueError):
-        _emit(_setup_failure(case, model, metadata), None)
+        _emit(_setup_failure(case, model, metadata, args.corpus_version), None)
         return 1
     try:
         authorizer = RecordingAuthorizer(FgaHttpAuthorizer.from_environment())
         gateway, aliases = gateway_from_manifest(_manifest(), authorizer)
         adapter = OpenAIResponsesAdapter()
     except (ConfigurationError, ValueError, OSError, ImportError):
-        _emit(_setup_failure(case, model, metadata), output_path)
+        _emit(_setup_failure(case, model, metadata, args.corpus_version), output_path)
         return 1
-    measurement = evaluate(case, adapter, gateway, aliases, authorizer, model=model, metadata=metadata)
+    measurement = evaluate(
+        case, adapter, gateway, aliases, authorizer,
+        model=model, corpus_version=args.corpus_version, metadata=metadata,
+    )
     appended = _emit(measurement, output_path)
     return 0 if appended and measurement["outcome"] in {"completed", "denied"} else 1
 

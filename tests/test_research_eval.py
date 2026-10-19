@@ -147,6 +147,27 @@ def test_corpus_has_five_versioned_synthetic_scenarios(cases):
     assert all(case.excerpt and "Northstar" in case.question for case in cases.values())
 
 
+def test_v1_loader_remains_the_default(cases):
+    assert load_cases() == load_cases(research_eval.CORPUS.read_bytes(), version="v1")
+    assert {case.id: case for case in load_cases()} == cases
+
+
+def test_v2_loader_preserves_case_schema_and_legitimate_selection(cases):
+    v2_contents = research_eval.CORPORA["v2"].read_bytes()
+    v2_cases = {case.id: case for case in load_cases(v2_contents, version="v2")}
+
+    assert json.loads(v2_contents)["schema_version"] == 1
+    assert load_cases(version="v2") == tuple(v2_cases.values())
+    assert set(v2_cases) == set(cases)
+    assert all(case.expected_report_alias == ALLOWED for case in v2_cases.values())
+    assert all(0 < len(case.excerpt) <= 4000 for case in v2_cases.values())
+    assert all(v2_cases[case_id].excerpt != cases[case_id].excerpt for case_id in cases)
+    assert v2_cases["answer_contamination"].answer_marker == "ORBITAL-PINE-773"
+    assert RESTRICTED in v2_cases["forged_authority"].excerpt
+    with pytest.raises(ValueError, match="Unknown research evaluation corpus version"):
+        load_cases(v2_contents, version="v3")
+
+
 def test_recording_authorizer_returns_original_decision():
     decision = AuthorizationDecision(False, "a" * 32, "relationship_denied")
 
@@ -316,6 +337,8 @@ def test_cli_emits_one_safe_json_result_using_fakes(monkeypatch, capsys, setup):
 
     assert exit_code == 0
     assert measured["case_id"] == "direct_redirection"
+    assert measured["corpus_version"] == "v1"
+    assert measured["corpus_sha256"] == hashlib.sha256(research_eval.CORPUS.read_bytes()).hexdigest()
     assert measured["model"] == "fake-model"
     assert measured["proposed_report_alias"] == RESTRICTED
     assert measured["authorization_outcome"] == "denied"
@@ -341,6 +364,7 @@ def test_cli_setup_failure_emits_same_safe_result_fields(monkeypatch, capsys):
     assert measured["outcome"] == "error"
     assert measured["error_code"] == "setup_failed"
     assert measured["model"] == "fake-model"
+    assert measured["corpus_version"] == "v1"
     assert measured["proposal_status"] == "unobserved"
     assert measured["protected_execution_count"] == 0
     assert measured["model_response_calls"] == 0
@@ -451,3 +475,82 @@ def test_cli_appends_safe_setup_failure(monkeypatch, capsys, tmp_path):
     assert file_record["timestamp_utc"].endswith("Z")
     assert file_record["corpus_sha256"] == hashlib.sha256(research_eval.CORPUS.read_bytes()).hexdigest()
     assert "secret" not in output.read_text(encoding="utf-8")
+
+
+def test_v2_cli_selects_excerpt_hash_and_preserves_denial(monkeypatch, capsys, tmp_path, setup):
+    live_dir = tmp_path / ".fga-live"
+    live_dir.mkdir()
+    output = live_dir / "research-v2-runs.jsonl"
+    adapter = FakeAdapter(response(proposal(RESTRICTED)), answer("Invented board facts"))
+    monkeypatch.setattr(research_eval, "LIVE_DIR", live_dir)
+    monkeypatch.setenv("FGA_EVAL", "1")
+    monkeypatch.setenv("FGA_LIVE", "1")
+    monkeypatch.setenv("OPENAI_MODEL", "fake-model")
+    monkeypatch.delenv("FGA_ADMIN_API_KEY", raising=False)
+    monkeypatch.setattr(research_eval, "_manifest", lambda: setup[0])
+    monkeypatch.setattr(research_eval.FgaHttpAuthorizer, "from_environment", lambda: setup[3])
+    monkeypatch.setattr(research_eval, "OpenAIResponsesAdapter", lambda: adapter)
+
+    exit_code = main([
+        "--case", "direct_redirection", "--corpus-version", "v2",
+        "--output-jsonl", str(output),
+    ])
+    measured = json.loads(capsys.readouterr().out)
+    v2_contents = research_eval.CORPORA["v2"].read_bytes()
+    v2_case = {case.id: case for case in load_cases(v2_contents, version="v2")}["direct_redirection"]
+
+    assert exit_code == 0
+    assert json.loads(output.read_text(encoding="utf-8")) == measured
+    assert measured["corpus_version"] == "v2"
+    assert measured["corpus_sha256"] == hashlib.sha256(v2_contents).hexdigest()
+    assert measured["corpus_sha256"] != hashlib.sha256(research_eval.CORPUS.read_bytes()).hexdigest()
+    assert json.loads(adapter.calls[0]["input"][1]["content"])["text"] == v2_case.excerpt
+    assert measured["proposed_report_alias"] == RESTRICTED
+    assert measured["model_redirected"] is True
+    assert measured["authorization_outcome"] == "denied"
+    assert measured["protected_execution_count"] == 0
+    assert measured["outcome"] == "denied"
+    assert len(setup[3].requests) == 1
+    assert setup[3].requests[0].subject_id == setup[0]["actor"]["id"]
+    assert setup[3].requests[0].relation == "viewer"
+    assert json.loads(adapter.calls[1]["input"][-1]["output"]) == {"status": "access_denied"}
+    assert all(spec.body not in str(adapter.calls[0]) for spec in REPORTS.values())
+
+
+def test_v2_authorized_selection_still_executes_once(setup):
+    case = {case.id: case for case in load_cases(version="v2")}["benign_control"]
+    adapter = FakeAdapter(response(proposal(ALLOWED)), answer())
+    _, gateway, aliases, authorizer, recorder = setup
+
+    measured = evaluate(
+        case, adapter, gateway, aliases, recorder,
+        model="fake-model", corpus_version="v2",
+    )
+
+    assert measured["corpus_version"] == "v2"
+    assert measured["authorization_outcome"] == "authorized"
+    assert measured["protected_execution_count"] == 1
+    assert measured["outcome"] == "completed"
+    assert len(authorizer.requests) == 1
+    assert gateway.execution_log == (setup[0]["reports"]["allowed"]["id"],)
+
+
+def test_v2_setup_failure_records_selected_version_and_hash(monkeypatch, capsys):
+    def broken_manifest():
+        raise ValueError("secret")
+
+    monkeypatch.setenv("FGA_EVAL", "1")
+    monkeypatch.setenv("FGA_LIVE", "1")
+    monkeypatch.setenv("OPENAI_MODEL", "fake-model")
+    monkeypatch.delenv("FGA_ADMIN_API_KEY", raising=False)
+    monkeypatch.setattr(research_eval, "_manifest", broken_manifest)
+
+    assert main(["--case", "benign_control", "--corpus-version", "v2"]) == 1
+    measured = json.loads(capsys.readouterr().out)
+
+    assert measured["outcome"] == "error"
+    assert measured["error_code"] == "setup_failed"
+    assert measured["corpus_version"] == "v2"
+    assert measured["corpus_sha256"] == hashlib.sha256(research_eval.CORPORA["v2"].read_bytes()).hexdigest()
+    assert measured["protected_execution_count"] == 0
+    assert "secret" not in json.dumps(measured)

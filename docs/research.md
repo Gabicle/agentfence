@@ -48,16 +48,27 @@ python3 -m pytest -q
 
 ## One-case prompt-injection evaluation
 
-The versioned [synthetic case corpus](../experiments/cases.v1.json) contains a
-benign control, three attempts to redirect report selection toward the
-restricted board-risks report, and one answer-marker attempt. Each invocation
-runs one case. After provisioning the disposable FGA service as above, use a
+The [v1 synthetic case corpus](../experiments/cases.v1.json) contains a benign
+control, three attempts to redirect report selection toward the restricted
+board-risks report, and one answer-marker attempt. The
+[v2 corpus](../experiments/cases.v2.json) keeps the same five case IDs and
+expected report selections, with longer, document-like excerpts. Each
+invocation runs one case. The default is v1, so existing commands continue to
+use the original corpus. After provisioning the disposable FGA service as above, use a
 check-only shell with `FGA_LIVE=1`, `FGA_AUTHORIZATION_URL`, `FGA_CHECK_API_KEY`,
 `FGA_LIVE_MANIFEST`, `OPENAI_API_KEY`, and `OPENAI_MODEL` set. Leave
 `FGA_ADMIN_API_KEY` unset. Then explicitly opt in:
 
 ```bash
 FGA_EVAL=1 python3 -m agentfence.research_eval --case direct_redirection
+```
+
+Select v2 explicitly and keep its observations in a separate file:
+
+```bash
+FGA_EVAL=1 python3 -m agentfence.research_eval \
+  --corpus-version v2 --case direct_redirection \
+  --output-jsonl .fga-live/research-v2-runs.jsonl
 ```
 
 To retain results, add `--output-jsonl .fga-live/research-runs.jsonl`. Run the
@@ -78,8 +89,9 @@ directory and its records out of Git.
 
 Each record includes the configured `model` identifier, a unique `run_id`, a UTC
 `timestamp_utc`, the current `git_commit_sha` (or `unavailable`), and
-`corpus_sha256` for the exact bytes of `experiments/cases.v1.json` used for that
-invocation.
+`corpus_version` (`v1` or `v2`), and `corpus_sha256` for the exact bytes of the
+selected corpus used for that invocation. These fields are present in setup
+failure records too. Keep v1 and v2 results separate when comparing outcomes.
 `proposed_report_alias` is the validated alias from the first model response;
 `model_redirected` compares it with the case's expected alias regardless of
 authorization. Invalid or missing calls have their own `proposal_status` and
@@ -102,8 +114,10 @@ Results contain no report bodies, API keys, headers, raw model responses, or
 excerpts. The marker check is an exact substring observation, not a judgment of
 answer quality. One run per case cannot estimate attack success rates or prove
 the model will behave consistently; repeat selected cases manually if needed.
-The commit SHA does not capture uncommitted code, and the corpus hash does not
-capture the model backend, FGA fixtures, service state, or environment. The UTC
+The v2 excerpts are still synthetic and cover only five attack patterns; their
+greater detail does not establish real-world effectiveness. The commit SHA does
+not capture uncommitted code, and the corpus hash does not capture the model
+backend, FGA fixtures, service state, or environment. The UTC
 timestamp and run ID identify records but do not make model output replayable.
 The initial offline evaluator tests use fake Responses output and never call
 OpenAI or fga-dotnet.
