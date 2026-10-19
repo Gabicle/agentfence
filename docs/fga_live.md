@@ -10,8 +10,9 @@ untouched.
 
 ## Create the disposable service
 
-Docker with a Compose plugin that supports `!override`, OpenSSL, and Python
-with pytest are required.
+Docker with Compose version 2.24.4 or later (required for `!override`),
+OpenSSL, and Python with pytest are required. The build also needs access to
+pull its Docker images and restore NuGet packages.
 Use a separate checkout of the baseline beside AgentFence; do not switch the
 ordinary fga-dotnet checkout:
 
@@ -90,12 +91,15 @@ unset db_name db_password admin_key
 Save the printed `.fga-live/fixture-<run-id>.json` path for the test process.
 It contains synthetic identifiers and attributes, not API keys.
 
-## Run the five live tests
+## Run the six live tests
 
 In a fresh, check-only shell, set the manifest path printed above. Do not pass
-the admin key to pytest. Four cases check allowed and denied responses through
-the real gateway and HTTP authorizer; the fifth checks fail-closed behavior for
-an unavailable endpoint.
+the admin key to pytest. Five tests contact the real authorization service:
+four check granted and denied reports through the gateway, and one sends a
+deterministic fake OpenAI proposal for the restricted board-risks report
+through ResearchAgent and the gateway. That test verifies an explicit
+`required_abac_denied` decision and zero protected executions. The sixth test
+checks fail-closed behavior against an unavailable endpoint.
 
 ```bash
 unset FGA_ADMIN_API_KEY FGA_SHOW_DECISIONS
@@ -120,7 +124,7 @@ FGA_LIVE=1 FGA_AUTHORIZATION_URL=http://127.0.0.1:8081 \
 unset check_key
 ```
 
-This prints `decision_id`, `approved`, and `reason_code` for each of the four
+This prints `decision_id`, `approved`, and `reason_code` for each of the five
 real authorization responses. Match each Python `decision_id` to the
 `DecisionId` in the API's structured `AuthorizationDecision` event ID `1001`.
 The ID originates in the `X-Authorization-Decision-Id` response header. Inspect

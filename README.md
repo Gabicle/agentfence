@@ -51,6 +51,8 @@ Two versioned synthetic [prompt-injection corpora](experiments/) were evaluated 
 
 Those model observations did not propose a restricted report. A separate [live denial test](tests/test_fga_live.py) sends a deterministic **fake model proposal** for the restricted board-risks report through the real ResearchAgent and Gateway to fga-dotnet. It verifies an explicit denial and **zero protected executions**. The combined evidence does not prove prompt-injection immunity: the samples are small and synthetic, model behavior can vary, and the contamination check detects only an exact marker.
 
+Fresh clones can reproduce the offline tests. Reviewers with the required infrastructure and credentials can collect new live observations. The original JSONL records are private and absent from Git, so the published repository alone cannot independently reanalyze the original 30 planned observations.
+
 ## Repository layout
 
 | Path | Purpose |
