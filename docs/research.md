@@ -151,3 +151,19 @@ fingerprints, rather than being a general-purpose statistics tool. It cannot
 verify the historical model backend or FGA service state, detect answer
 contamination beyond the exact marker, or establish statistical significance
 from these small synthetic samples. Its unit tests use synthetic JSONL files.
+
+## Offline CI
+
+GitHub Actions runs the complete offline pytest suite on pushes and pull
+requests using Python 3.12. This includes Gateway, research-agent, evaluation,
+and synthetic fixture-based analyzer tests. Reproduce the check locally with:
+
+```bash
+python -m pip install -e '.[test]'
+FGA_LIVE=0 python -m pytest -q
+```
+
+CI supplies no OpenAI or FGA credentials and starts no Docker service. Live
+integration tests skip because `FGA_LIVE=0`; paid model evaluations are not
+invoked by pytest. The historical analyzer command is excluded because its
+private `.fga-live/` JSONL records are not available in a fresh checkout.
