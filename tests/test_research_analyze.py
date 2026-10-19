@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 import agentfence.research_analyze as analyzer
+from agentfence.gateway import ActorRecord, Gateway, ReportRecord
+from agentfence.research import TRUSTED_ACTOR_KEY
+from agentfence.research_eval import RecordingAuthorizer, evaluate, load_cases
 
 
 CASE_ORDER = (
@@ -120,6 +124,98 @@ def test_service_failure_is_counted_separately(datasets):
 
     assert (result.approvals, result.denials, result.service_failures) == (14, 0, 1)
     assert result.failed == 1 and result.protected_executions == 14
+
+
+def test_authorizer_exception_record_is_accepted_without_a_decision(datasets):
+    _, v2, paths, write = datasets
+    row_index = next(i for i, row in enumerate(v2) if row["case_id"] == "benign_control")
+    metadata = {key: v2[row_index][key] for key in (
+        "run_id", "timestamp_utc", "git_commit_sha", "corpus_sha256"
+    )}
+    case = next(case for case in load_cases(version="v2") if case.id == "benign_control")
+    report_id = "synthetic-report"
+
+    class RaisingAuthorizer:
+        def authorize(self, request):
+            raise RuntimeError("synthetic transport failure")
+
+    class FakeAdapter:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return SimpleNamespace(status="completed", output=[SimpleNamespace(
+                    type="function_call", status="completed", name="read_report",
+                    call_id="call_1", arguments=json.dumps({"report_id": analyzer.LEGITIMATE}),
+                )])
+            return SimpleNamespace(status="completed", output=[SimpleNamespace(
+                type="message", role="assistant", status="completed",
+                content=[SimpleNamespace(type="output_text", text="Access denied.")],
+            )])
+
+    recorder = RecordingAuthorizer(RaisingAuthorizer())
+    gateway = Gateway(
+        {TRUSTED_ACTOR_KEY: ActorRecord("trusted-user", "eu-west", 2)},
+        {report_id: ReportRecord(report_id, report_id, "eu-west", 1, "synthetic body")},
+        recorder,
+    )
+    adapter = FakeAdapter()
+    measured = evaluate(
+        case, adapter, gateway, {analyzer.LEGITIMATE: report_id}, recorder,
+        model=analyzer.MODEL, corpus_version="v2", metadata=metadata,
+    )
+
+    assert measured["authorization_outcome"] == "service_failure"
+    assert measured["authorization_decision_approved"] is None
+    assert measured["authorization_decision_failure"] is None
+    assert measured["protected_execution_count"] == 0
+    assert measured["outcome"] == "error"
+    assert measured["error_code"] == "authorization_service_failure"
+    assert gateway.execution_log == ()
+    assert len(adapter.calls) == 2
+    assert "synthetic body" not in json.dumps(measured)
+    v2[row_index] = measured
+    write()
+
+    _, result = analyzer.analyze(*paths)
+
+    assert (result.approvals, result.denials, result.service_failures) == (14, 0, 1)
+    assert result.failed == 1 and result.protected_executions == 14
+    assert result.unauthorized_executions == 0
+
+
+@pytest.mark.parametrize(
+    ("approved", "failure", "outcome", "executions", "error_code"),
+    [
+        (False, None, "error", 0, "authorization_service_failure"),
+        (None, True, "error", 0, "authorization_service_failure"),
+        (True, True, "error", 0, "authorization_service_failure"),
+        (False, False, "error", 0, "authorization_service_failure"),
+        (None, None, "completed", 0, None),
+        (None, None, "error", 1, "authorization_service_failure"),
+        (None, None, "error", 0, "research_failed"),
+    ],
+)
+def test_service_failure_rejects_inconsistent_fields(
+    datasets, approved, failure, outcome, executions, error_code
+):
+    _, v2, paths, write = datasets
+    row = next(row for row in v2 if row["case_id"] == "benign_control")
+    row.update(
+        authorization_outcome="service_failure",
+        authorization_decision_approved=approved,
+        authorization_decision_failure=failure,
+        protected_execution_count=executions,
+        access_denied_result=True,
+        outcome=outcome,
+        error_code=error_code,
+    )
+    write()
+
+    with pytest.raises(analyzer.AnalysisError, match="service_failure"):
+        analyzer.analyze(*paths)
 
 
 @pytest.mark.parametrize(

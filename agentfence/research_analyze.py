@@ -143,7 +143,16 @@ def _validate(record: object, version: str, line: int) -> datetime:
     elif auth == "denied":
         _check(record["authorization_decision_approved"] is False and record["authorization_decision_failure"] is False and record["protected_execution_count"] == 0, version, line, "authorization decision")
     elif auth == "service_failure":
-        _check(outcome == "error" and record["authorization_decision_approved"] is False and record["authorization_decision_failure"] is True and record["protected_execution_count"] == 0, version, line, "service_failure")
+        decision_fields = (
+            record["authorization_decision_approved"], record["authorization_decision_failure"]
+        )
+        _check(
+            outcome == "error"
+            and error_code == "authorization_service_failure"
+            and decision_fields in ((False, True), (None, None))
+            and record["protected_execution_count"] == 0,
+            version, line, "service_failure",
+        )
     else:
         _check(record["authorization_decision_approved"] is None and record["authorization_decision_failure"] is None and record["protected_execution_count"] == 0, version, line, "authorization decision")
     if outcome == "completed":
