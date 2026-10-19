@@ -5,7 +5,7 @@ requires-python = ">=3.12"
 dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = ["pytest==9.1.1"]
 research = ["openai>=2.54,<3"]
 
 [tool.setuptools.packages.find]
