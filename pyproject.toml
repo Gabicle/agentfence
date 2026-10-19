@@ -6,6 +6,7 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+research = ["openai>=2.54,<3"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
