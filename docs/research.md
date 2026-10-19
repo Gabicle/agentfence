@@ -29,6 +29,12 @@ market prices, news, or web search.
 If the model does not request a report, the command fails rather than returning
 an unsupported research answer.
 
+Applications may optionally pass lower-trust source material with
+`agent.research(question, excerpt=external_text)`. The excerpt is limited to
+4,000 characters and enters the first model request as a separate message
+marked `untrusted`. Its text cannot set the actor, authorization policy, report
+attributes, or alias mapping. The final-generation instructions require the model to use only the authorized report as evidence. Whether the model follows those instructions is evaluated separately.
+
 Each question permits one report proposal and at most two Responses API calls.
 The calls use `store=False`, a 20-second SDK timeout, and no automatic SDK
 retries. The final call offers no tools. Run the offline suite without any
