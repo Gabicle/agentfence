@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import socket
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +20,7 @@ from agentfence import (
     ReportRecord,
     ToolProposal,
 )
+from agentfence.research import REPORTS, ResearchAgent, TRUSTED_ACTOR_KEY, gateway_from_manifest
 
 
 pytestmark = pytest.mark.live
@@ -196,3 +198,66 @@ def test_unavailable_endpoint_fails_closed(live_fixture) -> None:
 
     assert recorder.decisions == [AuthorizationDecision(False, failure="transport_error")]
     assert gateway.execution_log == ()
+
+
+def test_research_agent_restricted_report_is_denied_without_execution(live_fixture) -> None:
+    manifest, client = live_fixture
+    recorder = RecordingAuthorizer(client)
+    gateway, aliases = gateway_from_manifest(manifest, recorder)
+    call_id = "call_board_risks"
+
+    class FakeResponsesAdapter:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return SimpleNamespace(
+                    status="completed",
+                    output=[
+                        SimpleNamespace(
+                            type="function_call",
+                            status="completed",
+                            name="read_report",
+                            call_id=call_id,
+                            arguments=json.dumps({"report_id": "northstar-q2-board-risks"}),
+                        )
+                    ],
+                )
+            if len(self.calls) == 2:
+                return SimpleNamespace(
+                    status="completed",
+                    output=[
+                        SimpleNamespace(
+                            type="message",
+                            role="assistant",
+                            status="completed",
+                            content=[SimpleNamespace(type="output_text", text="Access denied.")],
+                        )
+                    ],
+                )
+            pytest.fail("Expected at most two model calls.")
+
+    adapter = FakeResponsesAdapter()
+    agent = ResearchAgent(
+        adapter, gateway, aliases, actor_key=TRUSTED_ACTOR_KEY, model="fake-model"
+    )
+
+    result = agent.research("Summarize Northstar Technologies' Q2 results.")
+
+    decision = _decision(recorder)
+    assert decision.approved is False
+    assert decision.reason_code == "required_abac_denied"
+    assert gateway.execution_log == ()
+    assert result.access_denied is True
+    assert result.summary == "Access denied for the requested report."
+    assert result.source is None
+    assert len(adapter.calls) == 2
+    assert all(REPORTS["northstar-q2-board-risks"].body not in str(call) for call in adapter.calls)
+    tool_output = adapter.calls[1]["input"][-1]
+    assert tool_output["type"] == "function_call_output"
+    assert tool_output["call_id"] == call_id
+    assert json.loads(tool_output["output"]) == {"status": "access_denied"}
+    assert adapter.calls[1]["tools"] == []
+    assert adapter.calls[1]["tool_choice"] == "none"
